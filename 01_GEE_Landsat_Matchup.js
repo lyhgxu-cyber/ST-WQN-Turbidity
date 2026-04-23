@@ -1,105 +1,109 @@
+```javascript
 // ======================================
-// In-situ 数据读取（CSV时间字符串过滤）
+// In-situ Data Matching & Spectral Extraction
+// Landsat 8/9 Time-Series Processing
 // ======================================
+
 var pts = ee.FeatureCollection("projects/wt-rs-inv-2025/assets/gee_matched_turbidity")
-  .filter(ee.Filter.stringStartsWith('Date', '2021-03'));
+  .filter(ee.Filter.stringStartsWith('Date', '2021'));
 
-var win = 3;        // ±days
-var minPix = 4;     // 最少有效像元
-var bufR = 400;     // buffer半径（m）
+var win = 3;             // Temporal window ± days
+var minPix = 4;          // Minimum valid pixel threshold
+var bufR = 400;          // Spatial buffer radius (meters)
 
-// ======================================
-// 水体掩膜
-// ======================================
+// JRC Global Surface Water Mask
 var water = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
   .select('occurrence')
   .gt(5);
 
 // ======================================
-// Sentinel-2 预处理函数
+// Landsat 8/9 Preprocessing Pipeline
 // ======================================
-function prepS2(img){
+function prepL89(img){
+  // Surface reflectance calibration & band renaming
+  var refl = img.select([
+      'SR_B2','SR_B3','SR_B4',
+      'SR_B5','SR_B6','SR_B7'
+    ])
+    .multiply(0.0000275)
+    .add(-0.2)
+    .rename([
+      'Blue','Green','Red',
+      'NIR','SWIR1','SWIR2'
+    ]);
 
-  var refl = img.select(['B2','B3','B4','B8','B11','B12'])
-    .multiply(0.0001)
-    .rename(['Blue','Green','Red','NIR','SWIR1','SWIR2']);
+  // QA Pixel cloud & shadow masking
+  var qa = img.select('QA_PIXEL');
+  var cloudMask = qa.bitwiseAnd(1<<4).eq(0)
+    .and(qa.bitwiseAnd(1<<3).eq(0));
 
-  var scl = img.select('SCL');
-
-  var mask = scl.neq(8)
-    .and(scl.neq(9))
-    .and(scl.neq(10))
-    .and(scl.neq(11))
-    .and(scl.neq(1))
-    .and(scl.neq(3));
-
+  // Apply masks and metadata
   return refl
-    .updateMask(mask)
+    .updateMask(cloudMask)
     .updateMask(water)
     .set({
-      'Satellite':'Sentinel2',
+      'Satellite':'Landsat',
       'system:time_start': img.get('system:time_start')
     });
 }
 
-// ======================================
-// Sentinel-2 影像集合
-// ======================================
-var s2Col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED");
+// Merged Landsat 8/9 Collection
+var l89Col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+  .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"));
 
 // ======================================
-// 核心匹配函数
+// Core Spatial-Temporal Extraction Function
 // ======================================
-function extract(points, col, scale, prepFn){
-
+function extract(points){
   return points.map(function(pt){
-
-    var cleanDateStr = ee.String(pt.get('Date')).trim();
-    var d = ee.Date.parse('yyyy-MM-dd HH:mm:ss', cleanDateStr);
-
+    // Parse in-situ timestamp
+    var d = ee.Date.parse('yyyy-MM-dd HH:mm:ss',
+      ee.String(pt.get('Date')).trim());
+    
     var buf = pt.geometry().buffer(bufR);
 
-    var imgs = col
+    // Temporal-spatial image filtering
+    var imgs = l89Col
       .filterBounds(buf)
-      .filterDate(
-        d.advance(-win,'day'),
-        d.advance(win,'day')
-      )
-      .map(prepFn);
+      .filterDate(d.advance(-win,'day'), d.advance(win,'day'))
+      .map(prepL89);
 
+    // Pixel statistics extraction
     return imgs.map(function(img){
-
       var stat = img.reduceRegion({
         reducer: ee.Reducer.mean()
-          .combine(ee.Reducer.stdDev(), '', true)
-          .combine(ee.Reducer.count(), '', true),
+          .combine(ee.Reducer.stdDev(),'',true)
+          .combine(ee.Reducer.count(),'',true),
         geometry: buf,
-        scale: scale,
+        scale: 30,
         maxPixels: 1e6
       });
 
+      // Assemble output feature
       return ee.Feature(pt.geometry(), pt.toDictionary())
         .set(stat)
-        .set('Satellite_Date', img.date().format('yyyy-MM-dd HH:mm:ss'));
-
+        .set({
+          'Image_Time': img.get('system:time_start'),
+          'Satellite_Date': img.date().format('yyyy-MM-dd HH:mm:ss')
+        });
     });
-
   }).flatten();
 }
 
 // ======================================
-// Sentinel-2 提取
+// Quality Control & Result Filtering
 // ======================================
-var matchS2 = extract(pts, s2Col, 20, prepS2)
+var matchL89 = extract(pts)
   .filter(ee.Filter.notNull(['Red_mean']))
   .filter(ee.Filter.gte('Red_count', minPix));
 
 // ======================================
-// 导出 Sentinel-2
+// Export Final Dataset to Drive
 // ======================================
 Export.table.toDrive({
-  collection: matchS2,
-  description: 'S_2021_03',
-  folder: 'GEE_Outputs',
+  collection: matchL89,
+  description: '2021_L89',
+  folder: 'GEE_Outputs1',
   fileFormat: 'CSV'
 });
+```
